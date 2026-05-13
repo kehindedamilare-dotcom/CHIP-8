@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <string>
+#include <random>
 #include <fstream>
 using namespace std;
 
@@ -31,6 +32,7 @@ public:
     uint8_t keypad[16]{};
     uint16_t opcode{};
     bool draw_flag{};
+    int8_t key_wait{};
 
     static constexpr int fontset_size = 80;
 
@@ -64,6 +66,7 @@ inline void chip8::initialize(chip8 &chip, int pc, int op, int in, int s) {
     chip.I = in;
     chip.SP = s;
     chip.opcode = op;
+    chip.key_wait = -1;
     chip.draw_flag = false;
     chip.delay_timer = 0;
     chip.sound_timer = 0;
@@ -81,6 +84,8 @@ inline void chip8::initialize(chip8 &chip, int pc, int op, int in, int s) {
     }
 
     srand(time(NULL)); // For random number generation
+
+    std::cout << "System Initialized!!" << endl;
 }
 
 inline void chip8::load_rom(chip8 &chip, const char* rom) {
@@ -102,6 +107,8 @@ inline void chip8::load_rom(chip8 &chip, const char* rom) {
         }
 
         delete[] buffer;
+    }else {
+        fprintf(stderr, "Failed to open rom file %s\n", rom);
     }
 }
 
@@ -162,12 +169,15 @@ inline void chip8::run_Cycle(chip8 &chip) {
                     break;
                 case 0x1:
                     chip.V[(chip.opcode & 0x0F00) >> 8] |= chip.V[(chip.opcode & 0x00F0) >> 4];
+                    chip.V[0xF] = 0;
                     break;
                 case 0x2:
-                    chip.V[(chip.opcode & 0x0F00) >> 5] &= chip.V[(chip.opcode & 0x00F0) >> 4];
+                    chip.V[(chip.opcode & 0x0F00) >> 8] &= chip.V[(chip.opcode & 0x00F0) >> 4];
+                    chip.V[0xF] = 0;
                     break;
                 case 0x3:
                     chip.V[(chip.opcode & 0x0F00) >> 8] ^= chip.V[(chip.opcode & 0x00F0) >> 4];
+                    chip.V[0xF] = 0;
                     break;
                 case 0x4:
                     chip.V[0xF] = ((chip.V[(chip.opcode & 0x0F00) >> 8] + chip.V[(chip.opcode & 0x00F0) >> 4]) > 255) ? 1 : 0;
@@ -193,6 +203,7 @@ inline void chip8::run_Cycle(chip8 &chip) {
                     fprintf(stderr, "UNKNOWN OPCODE: 0x%04X at PC=0x%03X\n", chip.opcode, chip.PC - 2);
                     break;
             }
+            break;
         case 0x9:
             if (chip.V[(chip.opcode & 0x0F00) >> 8] != chip.V[(chip.opcode & 0x00F0) >> 4]) {
                 chip.PC += 2;
@@ -208,9 +219,30 @@ inline void chip8::run_Cycle(chip8 &chip) {
             chip.V[(chip.opcode & 0x0F00) >> 8] = (rand() % 256) & (chip.opcode & 0x00FF);
             break;
 
+        case 0xD: { // Handle sprite drawing
+            chip.draw_flag = true;
+            uint8_t x = chip.V[(chip.opcode & 0x0F00) >> 8];
+            uint8_t y = chip.V[(chip.opcode & 0x00F0) >> 4];
+            uint8_t n = chip.opcode & 0x000F;
 
+            // Clear collision flag
+            chip.V[0xF] = 0;
 
-
+            for (int row = 0; row < n; row++) {
+                uint8_t sprite_byte = chip.memory[chip.I + row];
+                for (int col = 0; col < 8; col++) {
+                    if (sprite_byte & (0x80 >> col)) {
+                        int px = x + col;   // raw, no modulo
+                        int py = y + row;   // raw, no modulo
+                        if (px >= 64 || py >= 32) continue;  // now this actually works
+                        int idx = py * 64 + px;
+                        if (chip.display[idx] == 1) chip.V[0xF] = 1;
+                        chip.display[idx] ^= 1;
+                    }
+                }
+            }
+            break;
+        }
         case 0xE:
             switch (chip.opcode & 0x00FF) {
             case 0x9E:
@@ -231,18 +263,29 @@ inline void chip8::run_Cycle(chip8 &chip) {
                 case 0x07:
                     chip.V[(chip.opcode & 0x0F00) >> 8] = chip.delay_timer;
                     break;
-                case 0x0A: {
-                    bool key_pressed = false;
+            case 0x0A: {
+                if (chip.key_wait == -1) {
+                    // Phase 1: wait for any key press
+                    bool found = false;
                     for (int i = 0; i < 16; i++) {
                         if (chip.keypad[i]) {
-                            chip.V[(chip.opcode & 0x0F00) >> 8] = i;
-                            key_pressed = true;
+                            chip.key_wait = i;  // remember which key was pressed
+                            found = true;
                             break;
                         }
                     }
-                    if (!key_pressed) chip.PC -= 2;  // re-execute this instruction
-                    break;
+                    if (!found) chip.PC -= 2;  // no key yet, keep waiting
+                } else {
+                    // Phase 2: wait for that key to be released
+                    if (!chip.keypad[chip.key_wait]) {
+                        chip.V[(chip.opcode & 0x0F00) >> 8] = chip.key_wait;
+                        chip.key_wait = -1;  // done
+                    } else {
+                        chip.PC -= 2;  // still held, keep waiting
+                    }
                 }
+                break;
+            }
                 case 0x15:
                     chip.delay_timer = chip.V[(chip.opcode & 0x0F00) >> 8];
                     break;
@@ -266,13 +309,13 @@ inline void chip8::run_Cycle(chip8 &chip) {
                     for (int i = 0; i <= ((chip.opcode & 0x0F00) >> 8); i++) {
                         chip.memory[chip.I + i] = chip.V[i];
                     }
-                    chip.I = chip.I + (chip.opcode & 0x0F00 >> 8) + 1;
+                    chip.I = chip.I + ((chip.opcode & 0x0F00) >> 8) + 1;
                     break;
                 case 0x65:
-                    for (int i = 0; i < ((chip.opcode & 0x0F00) >> 8); i++) {
+                    for (int i = 0; i <= ((chip.opcode & 0x0F00) >> 8); i++) {
                         chip.V[i] = chip.memory[chip.I + i];
                     }
-                    chip.I = chip.I + (chip.opcode & 0x0F00 >> 8) + 1;
+                    chip.I = chip.I + ((chip.opcode & 0x0F00) >> 8) + 1;
                     break;
 
 
